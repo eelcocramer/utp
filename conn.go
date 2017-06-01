@@ -567,6 +567,7 @@ func (c *Conn) updateCanWrite() {
 }
 
 func (c *Conn) Write(p []byte) (n int, err error) {
+	time.Sleep(c.resendTimeout())
 	mu.Lock()
 	defer mu.Unlock()
 	for len(p) != 0 {
