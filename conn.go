@@ -21,6 +21,7 @@ type Conn struct {
 	peerWndSize      uint32
 	cur_window       uint32
 	connKey          connKey
+	duplicates       int
 
 	// Data waiting to be Read.
 	readBuf         []byte
@@ -33,13 +34,14 @@ type Conn struct {
 	// When the conn was allocated.
 	created time.Time
 
-	synAcked  bool // Syn is acked by the acceptor. Initiator also tracks it.
-	gotFin    missinggo.Event
-	wroteFin  missinggo.Event
-	err       error
-	closed    missinggo.Event
-	destroyed missinggo.Event
-	canWrite  missinggo.Event
+	synAcked     bool // Syn is acked by the acceptor. Initiator also tracks it.
+	gotFin       missinggo.Event
+	wroteFin     missinggo.Event
+	err          error
+	closed       missinggo.Event
+	destroyed    missinggo.Event
+	canWrite     missinggo.Event
+	delayDidPass missinggo.Event
 
 	unackedSends []*send
 	// Inbound payloads, the first is ack_nr+1.
@@ -57,6 +59,9 @@ type Conn struct {
 
 	// This timer fires when no packet has been received for a period.
 	packetReadTimeoutTimer *time.Timer
+
+	// This timer fires after the send timeout period to prevent flooding the network
+	sendDelayTimer *time.Timer
 }
 
 var (
@@ -212,7 +217,7 @@ func (c *Conn) write(_type st, connID uint16, payload []byte, seqNr uint16) (n i
 		seqNr:       seqNr,
 		conn:        c,
 	}
-	send.resendTimer = time.AfterFunc(c.resendTimeout(), send.timeoutResend)
+	send.resendTimer = time.AfterFunc(c.sendTimeout(), send.timeoutResend)
 	c.unackedSends = append(c.unackedSends, send)
 	c.cur_window += send.payloadSize
 	c.updateCanWrite()
@@ -305,9 +310,9 @@ func (c *Conn) seqSend(seqNr uint16) *send {
 	return c.unackedSends[i]
 }
 
-func (c *Conn) resendTimeout() time.Duration {
+func (c *Conn) sendTimeout() time.Duration {
 	l := c.latency()
-	ret := missinggo.JitterDuration(3*l, l)
+	ret := missinggo.JitterDuration(2*l, l)
 	return ret
 }
 
@@ -324,7 +329,7 @@ func (c *Conn) ackSkipped(seqNr uint16) {
 	case 3, 60:
 		ackSkippedResends.Add(1)
 		send.resend()
-		send.resendTimer.Reset(c.resendTimeout() * time.Duration(send.numResends))
+		send.resendTimer.Reset(c.sendTimeout() * time.Duration(send.numResends))
 	default:
 	}
 }
@@ -385,6 +390,7 @@ func (c *Conn) processDelivery(h header, payload []byte) {
 	inboundIndex := int(h.SeqNr - c.ack_nr - 1)
 	if inboundIndex < len(c.inbound) && c.inbound[inboundIndex].seen {
 		// Already received this packet.
+		c.duplicates++
 		return
 	}
 	// Derived from running in production:
@@ -509,6 +515,9 @@ func (c *Conn) Close() (err error) {
 	c.closed.Set()
 	c.writeFin()
 	c.lazyDestroy()
+	if logLevel >= 1 {
+		log.Printf("Received %d duplicate packets", c.duplicates)
+	}
 	return
 }
 
@@ -567,9 +576,15 @@ func (c *Conn) updateCanWrite() {
 }
 
 func (c *Conn) Write(p []byte) (n int, err error) {
-	time.Sleep(c.resendTimeout())
 	mu.Lock()
 	defer mu.Unlock()
+	if c.sendDelayTimer == nil {
+		c.sendDelayTimer = time.AfterFunc(0, func() {
+			c.delayDidPass.Set()
+		})
+	}
+	missinggo.WaitEvents(&mu, &c.delayDidPass)
+	c.delayDidPass.Clear()
 	for len(p) != 0 {
 		if c.wroteFin.IsSet() || c.closed.IsSet() {
 			err = errClosed
@@ -605,6 +620,7 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 			&c.connDeadlines.write.passed,
 			&c.canWrite)
 	}
+	c.sendDelayTimer.Reset(c.sendTimeout())
 	return
 }
 

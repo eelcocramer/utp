@@ -55,7 +55,7 @@ func (s *send) timeoutResend() {
 	if s.acked.IsSet() || s.conn.destroyed.IsSet() {
 		return
 	}
-	rt := s.conn.resendTimeout()
+	rt := s.conn.sendTimeout()
 	s.resend()
 	s.numResends++
 	s.resendTimer.Reset(rt * time.Duration(s.numResends))
